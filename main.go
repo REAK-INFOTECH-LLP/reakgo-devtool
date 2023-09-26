@@ -226,4 +226,3 @@ func unzip(src, dest string) error {
 
 	return nil
 }
-}
