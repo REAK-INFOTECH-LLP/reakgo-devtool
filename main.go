@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"sort"
+
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
+
 	"strings"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -46,6 +48,14 @@ func main() {
 				fmt.Println("file created and ready for use")
 			}
 			return
+
+		} else if os.Args[1] == "migration" {
+			// Automatically run migrations
+			if err := runMigrations("migrations"); err != nil {
+				fmt.Println("Migration Error:", err)
+				return
+			}
+
 		} else {
 			log.Println("please correct the command")
 		}
@@ -119,7 +129,6 @@ func initDB(dbUser, dbPassword, dbName string) error {
 	}
 
 	log.Println("Database initialized successfully.")
-	
 
 	return nil
 }
@@ -225,4 +234,76 @@ func unzip(src, dest string) error {
 	}
 
 	return nil
+}
+func runMigrations(migrationsDir string) error {
+
+	// Prompt the user for database connection details
+	dbUser, dbPassword, _ := promptForDatabaseInfo()
+	// Initialize the database connection
+	dbURL := fmt.Sprintf("%s:%s@/", dbUser, dbPassword)
+	var err error
+	db, err = sql.Open("mysql", dbURL) // Change to your preferred database driver
+	if err != nil {
+		return err
+	}
+
+	// Check the database connection
+	if err := db.Ping(); err != nil {
+		return err
+	}
+	// List migration files in the directory
+	files, err := ioutil.ReadDir(migrationsDir)
+	if err != nil {
+		return err
+	}
+
+	// Sort migration files by name
+	sortMigrationFiles(files)
+
+	// Begin a database transaction
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback() // Rollback if a panic occurs
+			panic(p)          // Re-throw the panic after rolling back
+		}
+	}()
+
+	// Execute each migration file
+	for _, file := range files {
+		if !file.IsDir() && strings.HasSuffix(file.Name(), ".sql") {
+			migrationPath := filepath.Join(migrationsDir, file.Name())
+			migrationSQL, err := ioutil.ReadFile(migrationPath)
+			if err != nil {
+				tx.Rollback() // Rollback on error
+				return err
+			}
+
+			// Execute the migration SQL within the transaction
+			_, err = tx.Exec(string(migrationSQL))
+			if err != nil {
+				tx.Rollback() // Rollback on error
+				return err
+			}
+			fmt.Printf("Executed migration: %s\n", file.Name())
+		}
+	}
+
+	// Commit the transaction if all migrations are successful
+	err = tx.Commit()
+	if err != nil {
+		tx.Rollback() // Rollback if commit fails
+		return err
+	}
+
+	return nil
+}
+func sortMigrationFiles(files []os.FileInfo) {
+	// Sort migration files by name
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Name() < files[j].Name()
+	})
 }
