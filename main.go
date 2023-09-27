@@ -51,7 +51,7 @@ func main() {
 
 		} else if os.Args[1] == "migration" {
 			// Automatically run migrations
-			if err := runMigrations("migrations"); err != nil {
+			if err := runMigrations("./migrations"); err != nil {
 				fmt.Println("Migration Error:", err)
 				return
 			}
@@ -73,7 +73,7 @@ func initReakgoFile() error {
 		return err
 	}
 	// Prompt the user for database connection details
-	dbUser, dbPassword, dbName := promptForDatabaseInfo()
+	dbUser, dbPassword, dbName := promptForDatabaseInfo("")
 
 	// Initialize the database and run migrations
 	if err := initDB(dbUser, dbPassword, dbName); err != nil {
@@ -83,7 +83,7 @@ func initReakgoFile() error {
 	return nil
 }
 
-func promptForDatabaseInfo() (string, string, string) {
+func promptForDatabaseInfo(check string) (string, string, string) {
 	reader := bufio.NewReader(os.Stdin)
 
 	fmt.Print("Please enter the database username: ")
@@ -91,8 +91,11 @@ func promptForDatabaseInfo() (string, string, string) {
 
 	fmt.Print("Please enter the database password: ")
 	dbPassword, _ := reader.ReadString('\n')
-
-	fmt.Print("Please enter the database name you want to create: ")
+	if check == "migration" {
+		fmt.Print("Please enter the database name: ")
+	} else {
+		fmt.Print("Please enter the database name you want to create: ")
+	}
 	dbName, _ := reader.ReadString('\n')
 
 	// Remove trailing newline characters
@@ -238,9 +241,10 @@ func unzip(src, dest string) error {
 func runMigrations(migrationsDir string) error {
 
 	// Prompt the user for database connection details
-	dbUser, dbPassword, _ := promptForDatabaseInfo()
+	dbUser, dbPassword, dbName := promptForDatabaseInfo("migration")
 	// Initialize the database connection
-	dbURL := fmt.Sprintf("%s:%s@/", dbUser, dbPassword)
+	// dbURL := fmt.Sprintf("%s:%s@/", dbUser, dbPassword)
+	dbURL := fmt.Sprintf("%s:%s@/%s", dbUser, dbPassword, dbName)
 	var err error
 	db, err = sql.Open("mysql", dbURL) // Change to your preferred database driver
 	if err != nil {
@@ -251,59 +255,161 @@ func runMigrations(migrationsDir string) error {
 	if err := db.Ping(); err != nil {
 		return err
 	}
+
+	// Get the list of applied migrations
+	appliedMigrations, err := getAppliedMigrations()
+	if err != nil {
+		log.Println(err)
+	}
+
 	// List migration files in the directory
-	files, err := ioutil.ReadDir(migrationsDir)
+	migrationFiles, err := listMigrationFiles(migrationsDir)
 	if err != nil {
-		return err
+		log.Println(err)
 	}
 
-	// Sort migration files by name
-	sortMigrationFiles(files)
+	// Sort migration files
+	sort.Strings(migrationFiles)
 
-	// Begin a database transaction
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if p := recover(); p != nil {
-			_ = tx.Rollback() // Rollback if a panic occurs
-			panic(p)          // Re-throw the panic after rolling back
+	// Apply pending migrations
+	for _, migrationFile := range migrationFiles {
+		if !stringSliceContains(appliedMigrations, migrationFile) {
+			// Read the migration SQL from the file
+			migrationSQL, err := readFileContents(filepath.Join(migrationsDir, migrationFile))
+			if err != nil {
+				log.Println(err)
+				return err
+			}
+			// Begin a transaction
+			tx, err := db.Begin()
+			if err != nil {
+				fmt.Println("Error starting transaction:", err)
+				return err
+			}
+			// Split SQL statements into individual statements
+			statements := strings.Split(migrationSQL, ";")
+			// Execute each SQL statement
+			for _, statement := range statements {
+				// Trim leading and trailing whitespace
+				statement = strings.TrimSpace(statement)
+				// Skip empty statements
+				if statement == "" {
+					continue
+				}
+				statement = statement + ";"
+				// Execute the SQL statement
+				_, err := tx.Exec(statement)
+				if err != nil {
+					fmt.Println("Error executing SQL statement:", err)
+					tx.Rollback()
+					return err
+				}
+			}
+			err = tx.Commit()
+			if err != nil {
+				fmt.Println("Error commiting SQL statement:", err)
+				return err
+			}
+			// Record the applied migration in a file
+			err = recordMigration(migrationFile)
+			if err != nil {
+				log.Println(err)
+				return err
+			}
+
+			fmt.Printf("Applied migration: %s\n", migrationFile)
 		}
-	}()
+	}
 
-	// Execute each migration file
+	fmt.Println("All pending migrations applied successfully.")
+	return nil
+}
+
+// Get a list of applied migrations based on recorded files
+func getAppliedMigrations() ([]string, error) {
+	var appliedMigrations []string
+	// Define a directory to store applied migration files
+	appliedDir := "./applied_migrations" // Change to your desired directory
+
+	// Create the directory if it doesn't exist
+	if _, err := os.Stat(appliedDir); os.IsNotExist(err) {
+		err := os.Mkdir(appliedDir, os.ModePerm)
+		if err != nil {
+			return appliedMigrations, err
+		}
+	}
+
+	// List applied migration files
+	files, err := ioutil.ReadDir(appliedDir)
+	if err != nil {
+		return appliedMigrations, err
+	}
+
 	for _, file := range files {
 		if !file.IsDir() && strings.HasSuffix(file.Name(), ".sql") {
-			migrationPath := filepath.Join(migrationsDir, file.Name())
-			migrationSQL, err := ioutil.ReadFile(migrationPath)
-			if err != nil {
-				tx.Rollback() // Rollback on error
-				return err
-			}
-
-			// Execute the migration SQL within the transaction
-			_, err = tx.Exec(string(migrationSQL))
-			if err != nil {
-				tx.Rollback() // Rollback on error
-				return err
-			}
-			fmt.Printf("Executed migration: %s\n", file.Name())
+			appliedMigrations = append(appliedMigrations, file.Name())
 		}
 	}
 
-	// Commit the transaction if all migrations are successful
-	err = tx.Commit()
+	return appliedMigrations, nil
+}
+
+// Record a migration as applied in a file
+func recordMigration(name string) error {
+	// Define a directory to store applied migration files
+	appliedDir := "./applied_migrations" // Change to your desired directory
+
+	// Create the directory if it doesn't exist
+	if _, err := os.Stat(appliedDir); os.IsNotExist(err) {
+		err := os.Mkdir(appliedDir, os.ModePerm)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Create a new migration file with a unique name based on a timestamp
+	filePath := filepath.Join(appliedDir, name)
+
+	// Create and write the migration file
+	file, err := os.Create(filePath)
 	if err != nil {
-		tx.Rollback() // Rollback if commit fails
 		return err
 	}
+	defer file.Close()
 
 	return nil
 }
-func sortMigrationFiles(files []os.FileInfo) {
-	// Sort migration files by name
-	sort.Slice(files, func(i, j int) bool {
-		return files[i].Name() < files[j].Name()
-	})
+
+// List migration files in the directory
+func listMigrationFiles(dirPath string) ([]string, error) {
+	var migrationFiles []string
+	files, err := os.ReadDir(dirPath)
+	if err != nil {
+		return migrationFiles, err
+	}
+	for _, file := range files {
+		if strings.HasSuffix(file.Name(), ".sql") {
+			migrationFiles = append(migrationFiles, file.Name())
+		}
+	}
+	return migrationFiles, nil
+}
+
+// Read file contents
+func readFileContents(filePath string) (string, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// Check if a string exists in a slice of strings
+func stringSliceContains(slice []string, str string) bool {
+	for _, s := range slice {
+		if s == str {
+			return true
+		}
+	}
+	return false
 }
